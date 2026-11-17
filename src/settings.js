@@ -65,6 +65,12 @@ const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : async (cmd, arg
       }
     };
   }
+  if (cmd === 'get_gadget_config') {
+    return {
+      mascot_scale: 'standard',
+      update_notify_enabled: true
+    };
+  }
   return true;
 };
 
@@ -91,6 +97,7 @@ const toggleSoundEnabled = document.getElementById('toggle-sound-enabled');
 const inputSoundVolume = document.getElementById('input-sound-volume');
 const soundVolumeDisplay = document.getElementById('sound-volume-display');
 const btnTestSound = document.getElementById('btn-test-sound');
+const toggleUpdateNotifyEnabled = document.getElementById('toggle-update-notify-enabled');
 
 const scaleRadios = document.querySelectorAll('input[name="mascot-scale"]');
 
@@ -376,12 +383,17 @@ async function loadConfigs() {
     if (liveQuotesQuietStart) liveQuotesQuietStart.value = lq.quiet_hours_start || '22:00';
     if (liveQuotesQuietEnd) liveQuotesQuietEnd.value = lq.quiet_hours_end || '07:00';
 
-    // マスコット表示サイズ（スケール）のバインド (Issue #25)
+    // マスコット表示サイズ（スケール）・アップデート通知設定のバインド (Issue #25, #70)
     try {
       const gConfig = await invoke('get_gadget_config');
-      if (gConfig && gConfig.mascot_scale) {
-        const targetRadio = document.querySelector(`input[name="mascot-scale"][value="${gConfig.mascot_scale}"]`);
-        if (targetRadio) targetRadio.checked = true;
+      if (gConfig) {
+        if (gConfig.mascot_scale) {
+          const targetRadio = document.querySelector(`input[name="mascot-scale"][value="${gConfig.mascot_scale}"]`);
+          if (targetRadio) targetRadio.checked = true;
+        }
+        if (toggleUpdateNotifyEnabled) {
+          toggleUpdateNotifyEnabled.checked = gConfig.update_notify_enabled !== false;
+        }
       }
     } catch (_) {}
 
@@ -605,6 +617,7 @@ btnResetDefaults.addEventListener('click', () => {
   if (inputBubbleDuration) inputBubbleDuration.value = 30;
   if (inputTouchDuration) inputTouchDuration.value = 8;
   if (toggleSoundEnabled) toggleSoundEnabled.checked = true;
+  if (toggleUpdateNotifyEnabled) toggleUpdateNotifyEnabled.checked = true;
   if (inputSoundVolume) inputSoundVolume.value = 30;
   if (soundVolumeDisplay) soundVolumeDisplay.textContent = '30%';
 
@@ -785,6 +798,10 @@ btnSave.addEventListener('click', async () => {
     const checkedScale = document.querySelector('input[name="mascot-scale"]:checked');
     if (checkedScale) {
       await invoke('set_mascot_scale', { scale: checkedScale.value });
+    }
+
+    if (toggleUpdateNotifyEnabled) {
+      await invoke('set_update_notify_enabled', { enabled: toggleUpdateNotifyEnabled.checked });
     }
 
     showStatus('設定を保存してマスコットへ適用しました！', 'success');

@@ -749,4 +749,126 @@ describe('main.js UI Logic & Regression Suite', () => {
     expect(mascotInputBar.classList.contains('hidden')).toBe(true);
     expect(chips[0].classList.contains('active')).toBe(false);
   });
+
+  it('新バージョン検知時に更新バッジ表示・アップデート吹き出し表示・shown通知が行われる (Issue #70)', async () => {
+    const updateInfo = {
+      update_available: true,
+      current_version: '1.1.11',
+      latest_version: '1.2.0',
+      show_badge: true,
+      show_bubble: true,
+      distribution_url: 'https://mowthow-works.com/desktop-mascot-for-muse/',
+      notify_enabled: true,
+    };
+
+    invokeMock.mockImplementation(async (cmd) => {
+      if (cmd === 'get_usage_limit') {
+        return { plan_name: '無料プラン', used_percent: 25, remaining_percent: 75, reset_text: '11月14日リセット' };
+      }
+      if (cmd === 'check_for_app_update') return updateInfo;
+      if (cmd === 'handle_update_notification_action') {
+        return { ...updateInfo, show_bubble: false };
+      }
+      return {};
+    });
+
+    document.getElementById('btn-refresh-limit').click();
+    await vi.advanceTimersByTimeAsync(1000);
+
+    const badge = document.getElementById('avatar-update-badge');
+    const bubble = document.getElementById('mascot-bubble');
+    const titleEl = bubble.querySelector('.mascot-bubble-title');
+    const textEl = document.getElementById('mascot-bubble-text');
+
+    expect(badge.classList.contains('hidden')).toBe(false);
+    expect(badge.textContent).toBe('↑');
+    expect(bubble.classList.contains('hidden')).toBe(false);
+    expect(bubble.classList.contains('is-update')).toBe(true);
+    expect(titleEl.textContent).toBe('🔔 アップデート');
+    expect(textEl.textContent).toBe('新しいバージョン v1.2.0 が出てるよ！');
+    expect(invokeMock).toHaveBeenCalledWith('handle_update_notification_action', {
+      action: 'shown',
+      version: '1.2.0',
+    });
+  });
+
+  it('アップデート吹き出しの3アクションボタンと更新バッジクリックが正しく動作し利用枠再取得が誤発火しない (Issue #70)', async () => {
+    const updateInfo = {
+      update_available: true,
+      current_version: '1.1.11',
+      latest_version: '1.2.0',
+      show_badge: true,
+      show_bubble: true,
+      distribution_url: 'https://mowthow-works.com/desktop-mascot-for-muse/',
+      notify_enabled: true,
+    };
+
+    invokeMock.mockImplementation(async (cmd) => {
+      if (cmd === 'get_usage_limit') {
+        return { plan_name: '無料プラン', used_percent: 25, remaining_percent: 75, reset_text: '11月14日リセット' };
+      }
+      if (cmd === 'check_for_app_update') return updateInfo;
+      if (cmd === 'handle_update_notification_action') {
+        return { ...updateInfo, show_bubble: false };
+      }
+      if (cmd === 'open_release_page') return null;
+      return {};
+    });
+
+    const btnRefreshLimit = document.getElementById('btn-refresh-limit');
+    const bubble = document.getElementById('mascot-bubble');
+
+    // 1. open ボタン
+    btnRefreshLimit.click();
+    await vi.advanceTimersByTimeAsync(1000);
+    const openBtn = document.querySelector('.mascot-update-action-open');
+    const snoozeBtn = document.querySelector('.mascot-update-action-snooze');
+    const skipBtn = document.querySelector('.mascot-update-action-skip');
+    expect(openBtn).not.toBeNull();
+    expect(snoozeBtn).not.toBeNull();
+    expect(skipBtn).not.toBeNull();
+
+    openBtn.click();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(bubble.classList.contains('hidden')).toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith('handle_update_notification_action', {
+      action: 'open',
+      version: '1.2.0',
+    });
+
+    // 2. snooze ボタン
+    btnRefreshLimit.click();
+    await vi.advanceTimersByTimeAsync(1000);
+    document.querySelector('.mascot-update-action-snooze').click();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(bubble.classList.contains('hidden')).toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith('handle_update_notification_action', {
+      action: 'snooze',
+      version: '1.2.0',
+    });
+
+    // 3. skip ボタン
+    btnRefreshLimit.click();
+    await vi.advanceTimersByTimeAsync(1000);
+    document.querySelector('.mascot-update-action-skip').click();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(bubble.classList.contains('hidden')).toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith('handle_update_notification_action', {
+      action: 'skip',
+      version: '1.2.0',
+    });
+
+    // 4. 更新バッジクリックで open_release_page のみ発火し、ネームプレートの get_usage_limit(forceRefresh:true) が誤発火しないこと
+    invokeMock.mockClear();
+    const badge = document.getElementById('avatar-update-badge');
+    expect(badge.classList.contains('hidden')).toBe(false);
+    badge.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+    badge.dispatchEvent(new Event('pointerup', { bubbles: true }));
+    badge.click();
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(invokeMock).toHaveBeenCalledWith('open_release_page');
+    expect(invokeMock).not.toHaveBeenCalledWith('get_usage_limit', { forceRefresh: true });
+    expect(invokeMock).not.toHaveBeenCalledWith('drag_window');
+  });
 });

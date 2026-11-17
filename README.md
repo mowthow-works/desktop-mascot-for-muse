@@ -1,6 +1,6 @@
 # Desktop Mascot for Muse
 
-[![Release](https://img.shields.io/badge/version-v1.1.10-blue.svg)](https://github.com/mowthow-works/desktop-mascot-for-muse/releases)
+[![Release](https://img.shields.io/badge/version-v1.1.11-blue.svg)](https://github.com/mowthow-works/desktop-mascot-for-muse/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6.svg)](https://www.microsoft.com/windows)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -35,6 +35,7 @@ Muse（パーソナルAIエージェント `https://muse.ai`）の Windows 向�
 - **新着通知**：新着メッセージをルパン風パタパタタイピング吹き出しで通知。未読バッジ（🔴 1〜9+）も表示
 - **クイック1行入力＆おまかせショートカット**：セッション画面を開かず、マスコット横のミニ入力バーからそのまま質問を送信（日本語打鍵音つき）。「物忘れが多いから改善して」「会話を仕切り直して」などの初心者向け定型リクエストもワンクリックで呼び出し可能
 - **利用枠の可視化**：残り利用枠に応じてマスコット外周枠の色が変化し、ネームプレートに残量 % を常時表示
+- **アップデート通知**：起動時・定期チェックで新バージョンを検知するとマスコットの吹き出しで1回お知らせし、ネームプレート横に `↑` バッジを表示。クリックで配布ページ（`https://mowthow-works.com/desktop-mascot-for-muse/`）を開けるほか、24時間スヌーズ・スキップ・設定画面からの ON/OFF 切替に対応
 
 <div align="center">
   <table>
@@ -103,6 +104,7 @@ Muse（パーソナルAIエージェント `https://muse.ai`）の Windows 向�
 | **クイック1行入力（💬）** | アバター右クリック または 💬ボタンでミニ入力バーを展開、その場で質問や「おまかせショートカット」の定型リクエストを送信（`Enter` で送信 / `Esc` で閉じる） |
 | **マスコットをダブルクリック** | Muse AI チャット画面（セッション画面）を開く（前回終了時の位置・サイズを復元） |
 | **吹き出し / 未読バッジをクリック** | チャット画面を開いてすぐ返信（未読バッジクリア） |
+| **更新バッジ（`↑`）/ アップデート吹き出し** | 新バージョン検知時に表示。クリックで配布ページ（`https://mowthow-works.com/desktop-mascot-for-muse/`）を開く（吹き出しから24時間スヌーズ・このバージョンの通知スキップも選択可能） |
 | **チャット画面の `−` / `×` ボタン** | チャット画面を隠してマスコット状態へ最小化 |
 | **他アプリを操作（チャット画面が裏へ）** | マスコットが自動的に最前面へ現れる（チャット画面が表に戻ると自動非表示） |
 | **`Ctrl + Shift + M`** | チャット画面 ⇄ マスコット状態の表示トグル（グローバルホットキー） |
@@ -117,7 +119,7 @@ Muse（パーソナルAIエージェント `https://muse.ai`）の Windows 向�
 
 本リポジトリには、著作権および汎用性（ユーザーごとにアバターが異なる点）への配慮から **アバター動画（`.mp4`）を含めていません**（設定ファイル `setting.json` と `quotes.json` のみ同梱）。ご自身のアバター動画を用意して配置してください。
 
-- **GUI 設定画面**：トレイメニューの「設定...」から、動作タイマー（放置時間・吹き出し秒数等）、放置動画ごとの有効/無効、セリフの追加・編集が行えます
+- **GUI 設定画面**：トレイメニューの「設定...」から、動作タイマー（放置時間・吹き出し秒数等）、アップデート通知の ON/OFF、放置動画ごとの有効/無効、セリフの追加・編集が行えます
 - **ホットリロード**：`setting.json` と `quotes.json` は、アプリ起動中でも保存するだけで 3 秒以内に自動反映されます
 - **動画の配置先**：設定画面（「フォルダ・データ管理」タブ）の「フォルダを開く」からアクセスできます。アプリアップデート時の動画・設定消失を防ぐため、通常は OS の永続データ領域（`%LOCALAPPDATA%\works.mowthow.muse.gadgets\avatars\`）が使用されます。基本動画 5 種類（`idle` / `waking` / `working` / `making_something` / `milestone_level_up`）は `avatars/` 直下、放置アクション用は `avatars/plugin/` フォルダへ配置してください（実行ファイル階層に `portable` ファイルを置くことでローカルの `avatars/` を使うポータブル運用も可能）
 

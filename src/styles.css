@@ -284,6 +284,10 @@ body {
 }
 
 .avatar-name {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
   font-size: 11px;
   font-weight: 700;
   color: var(--text-primary);
@@ -1082,6 +1086,35 @@ body.mode-mascot .avatar-name.refreshing {
   background: rgba(239, 68, 68, 0.22);
 }
 
+/* アップデート通知バッジ (Issue #70: 通常・マスコット両モード共通表示) */
+.avatar-update-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: Consolas, monospace;
+  font-size: var(--mascot-badge-font, 10px);
+  font-weight: 800;
+  color: #0f172a;
+  background: linear-gradient(135deg, #38bdf8, #0ea5e9);
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  border-radius: 999px;
+  padding: 1px 5px;
+  line-height: 1.1;
+  cursor: pointer;
+  box-shadow: 0 0 6px rgba(56, 189, 248, 0.55);
+  transition: transform 0.15s ease, filter 0.2s ease, box-shadow 0.2s ease;
+}
+
+.avatar-update-badge:hover {
+  transform: scale(1.14);
+  filter: brightness(1.08);
+  box-shadow: 0 0 10px rgba(56, 189, 248, 0.85);
+}
+
+.avatar-update-badge.hidden {
+  display: none !important;
+}
+
 /* 共通非表示ユーティリティ */
 .hidden {
   display: none !important;
@@ -1190,6 +1223,26 @@ body.mode-mascot .hero-card.bubble-on-left .mascot-bubble.is-quote .mascot-bubbl
 .mascot-bubble.is-quote .mascot-bubble-text {
   color: #e2e8f0;
   font-style: italic;
+}
+
+.mascot-bubble.is-update {
+  background: rgba(12, 26, 46, 0.96);
+  border: 1.5px solid rgba(56, 189, 248, 0.85);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.72), 0 0 18px rgba(56, 189, 248, 0.4);
+}
+
+.mascot-bubble.is-update .mascot-bubble-tail {
+  border-right-color: rgba(12, 26, 46, 0.96);
+  filter: drop-shadow(-1.5px 0 0 rgba(56, 189, 248, 0.85));
+}
+
+body.mode-mascot .hero-card.bubble-on-left .mascot-bubble.is-update .mascot-bubble-tail {
+  border-left-color: rgba(12, 26, 46, 0.96) !important;
+  filter: drop-shadow(1.5px 0 0 rgba(56, 189, 248, 0.85)) !important;
+}
+
+.mascot-bubble.is-update .mascot-bubble-title {
+  color: #7dd3fc;
 }
 
 .mascot-bubble-tail {

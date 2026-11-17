@@ -10,18 +10,50 @@ test.describe('Desktop Mascot for Muse - Real Browser UI & Layout Regression Sui
       window.__MOCK_MESSAGES__ = [
         { role: 'assistant', text: 'こんにちは！何かお手伝いしましょうか？' },
       ];
+      window.__MOCK_GADGET_CONFIG__ = {
+        size_mode: 'mascot',
+        mascot_scale: 'standard',
+        mascot_bubble_on_left: true,
+        message_limit: 5,
+        avatar_name: 'ラッキー',
+        update_notify_enabled: true,
+      };
+      window.__MOCK_UPDATE_INFO__ = {
+        update_available: false,
+        current_version: '1.1.11',
+        latest_version: null,
+        show_badge: false,
+        show_bubble: false,
+        distribution_url: 'https://mowthow-works.com/desktop-mascot-for-muse/',
+        notify_enabled: true,
+      };
 
       window.__TAURI__ = {
         core: {
           invoke: async (cmd, args) => {
             window.__TAURI_INVOKED__.push({ cmd, args });
             if (cmd === 'get_gadget_config') {
+              return window.__MOCK_GADGET_CONFIG__;
+            }
+            if (cmd === 'check_for_app_update') {
+              return window.__MOCK_UPDATE_INFO__;
+            }
+            if (cmd === 'handle_update_notification_action') {
               return {
-                size_mode: 'mascot',
-                mascot_scale: 'standard',
-                mascot_bubble_on_left: true,
-                message_limit: 5,
-                avatar_name: 'ラッキー',
+                ...window.__MOCK_UPDATE_INFO__,
+                show_bubble: false,
+              };
+            }
+            if (cmd === 'open_release_page') {
+              return null;
+            }
+            if (cmd === 'set_update_notify_enabled') {
+              window.__MOCK_GADGET_CONFIG__.update_notify_enabled = !!args?.enabled;
+              return {
+                ...window.__MOCK_UPDATE_INFO__,
+                notify_enabled: !!args?.enabled,
+                show_badge: false,
+                show_bubble: false,
               };
             }
             if (cmd === 'get_session_status') {
@@ -317,5 +349,78 @@ test.describe('Desktop Mascot for Muse - Real Browser UI & Layout Regression Sui
     });
     expect(sentAfterConfirm).toBeTruthy();
     await expect(inputBar).toBeHidden();
+  });
+
+  test('Issue #70: 新バージョン検知時に更新バッジ・アップデート吹き出しが表示され、吹き出し本体とバッジのクリックが正しく動作すること', async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__MOCK_UPDATE_INFO__ = {
+        update_available: true,
+        current_version: '1.1.11',
+        latest_version: '1.2.0',
+        show_badge: true,
+        show_bubble: true,
+        distribution_url: 'https://mowthow-works.com/desktop-mascot-for-muse/',
+        notify_enabled: true,
+      };
+    });
+
+    await page.goto('/index.html');
+
+    const updateBadge = page.locator('#avatar-update-badge');
+    const bubble = page.locator('#mascot-bubble');
+    await expect(updateBadge).toBeVisible();
+    await expect(updateBadge).toHaveText('↑');
+    await expect(bubble).toBeVisible();
+    await expect(bubble).toHaveClass(/is-update/);
+    await expect(bubble.locator('.mascot-bubble-title')).toHaveText('🔔 アップデート');
+
+    // タイピング完了後に3つのアクションボタンが表示されること
+    await expect(page.locator('.mascot-update-action-open')).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('.mascot-update-action-snooze')).toBeVisible();
+    await expect(page.locator('.mascot-update-action-skip')).toBeVisible();
+
+    // 吹き出し本体をクリックしても restore_from_mascot は呼ばれず、open アクションが呼ばれること
+    await page.locator('#mascot-bubble-text').click();
+    await expect(bubble).toBeHidden();
+
+    const bubbleClickResult = await page.evaluate(() => ({
+      calledRestore: window.__TAURI_INVOKED__.some((c) => c.cmd === 'restore_from_mascot'),
+      openAction: window.__TAURI_INVOKED__.find(
+        (c) => c.cmd === 'handle_update_notification_action' && c.args?.action === 'open'
+      ),
+    }));
+    expect(bubbleClickResult.calledRestore).toBe(false);
+    expect(bubbleClickResult.openAction).toBeTruthy();
+    expect(bubbleClickResult.openAction.args.version).toBe('1.2.0');
+
+    // ネームプレート横の ↑ バッジをクリックすると open_release_page が呼ばれること
+    await expect(updateBadge).toBeVisible();
+    await updateBadge.click();
+    const badgeClickResult = await page.evaluate(() => {
+      return window.__TAURI_INVOKED__.some((c) => c.cmd === 'open_release_page');
+    });
+    expect(badgeClickResult).toBe(true);
+  });
+
+  test('Issue #70: 設定画面でアップデート通知のON/OFFトグルを変更し保存すると set_update_notify_enabled が呼ばれること', async ({ page }) => {
+    await page.setViewportSize({ width: 640, height: 720 });
+    await page.goto('/settings.html');
+
+    await expect(page.locator('#tab-timers')).toBeVisible();
+    const toggleInput = page.locator('#toggle-update-notify-enabled');
+    const toggleSwitch = page.locator('label.toggle-switch:has(#toggle-update-notify-enabled)');
+    await expect(toggleInput).toBeAttached();
+    await expect(toggleSwitch).toBeVisible();
+    await expect(toggleInput).toBeChecked();
+
+    await toggleSwitch.click();
+    await expect(toggleInput).not.toBeChecked();
+
+    await page.locator('#btn-save').click();
+    const saveUpdateNotifyCall = await page.evaluate(() => {
+      return window.__TAURI_INVOKED__.find((c) => c.cmd === 'set_update_notify_enabled');
+    });
+    expect(saveUpdateNotifyCall).toBeTruthy();
+    expect(saveUpdateNotifyCall.args).toEqual({ enabled: false });
   });
 });

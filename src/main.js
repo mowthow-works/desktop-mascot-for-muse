@@ -9,6 +9,25 @@ const invoke = window.__TAURI__ ? window.__TAURI__.core.invoke : async (cmd, arg
     { role: 'assistant', text: '承知しました！本日のスケジュールを確認しますね。' }
   ];
   if (cmd === 'get_usage_limit') return { plan_name: '無料プラン', used_percent: 17, remaining_percent: 83, reset_text: '1週間の上限は11月6日にリセットされます', updated_at: '2026-11-02 21:00' };
+  if (cmd === 'check_for_app_update') return {
+    update_available: false,
+    current_version: '1.1.11',
+    latest_version: null,
+    show_badge: false,
+    show_bubble: false,
+    distribution_url: 'https://mowthow-works.com/desktop-mascot-for-muse/',
+    notify_enabled: true
+  };
+  if (cmd === 'handle_update_notification_action') return {
+    update_available: false,
+    current_version: '1.1.11',
+    latest_version: null,
+    show_badge: false,
+    show_bubble: false,
+    distribution_url: 'https://mowthow-works.com/desktop-mascot-for-muse/',
+    notify_enabled: true
+  };
+  if (cmd === 'open_release_page') return null;
   return {};
 };
 
@@ -44,6 +63,7 @@ const btnFetchAvatar = document.getElementById('btn-fetch-avatar');
 const avatarNameEl = document.getElementById('avatar-name');
 const avatarNameTextEl = document.getElementById('avatar-name-text');
 const avatarLimitBadgeEl = document.getElementById('avatar-limit-badge');
+const avatarUpdateBadgeEl = document.getElementById('avatar-update-badge');
 const avatarStatusPillEl = document.getElementById('avatar-status-pill');
 const avatarStatusTextEl = document.getElementById('avatar-status-text');
 const unreadBadgeEl = document.getElementById('unread-badge');
@@ -95,6 +115,11 @@ let assistantCommitTimer = null;
 let lastKnownAvatarBlobUrl = null;
 let typingTimer = null;
 let autoHideTimer = null;
+let currentBubbleKind = 'message'; // 'message' | 'quote' | 'update'
+let currentUpdateBubbleVersion = null;
+let currentUpdateInfo = null;
+let pendingUpdateBubbleVersion = null;
+let isCheckingAppUpdate = false;
 
 // ==========================================
 // ルパン風パタパタタイピング吹き出し制御
@@ -380,6 +405,48 @@ function renderMascotOptions(options) {
   scrollMascotBubbleToBottom();
 }
 
+// アップデート通知アクションボタンの描画 (Issue #70)
+function renderUpdateBubbleActions(version) {
+  if (!mascotBubbleOptions) return;
+  mascotBubbleOptions.innerHTML = '';
+
+  const targetVersion = version || currentUpdateInfo?.latest_version || null;
+  const actions = [
+    {
+      label: '🌐 配布ページを開く',
+      className: 'mascot-update-action-open',
+      action: 'open',
+    },
+    {
+      label: '⏰ あとで（24時間）',
+      className: 'mascot-update-action-snooze',
+      action: 'snooze',
+    },
+    {
+      label: '🙈 このバージョンは知らせない',
+      className: 'mascot-update-action-skip',
+      action: 'skip',
+    },
+  ];
+
+  actions.forEach((item) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = `mascot-option-btn ${item.className}`;
+    btn.textContent = item.label;
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      hideMascotBubble();
+      sendUpdateNotificationAction(item.action, targetVersion);
+    });
+    mascotBubbleOptions.appendChild(btn);
+  });
+
+  mascotBubbleOptions.classList.remove('hidden');
+  scrollMascotBubbleToBottom();
+  scheduleSyncMascotHitRects();
+}
+
 // 吹き出しスクロールコンテナ（.mascot-bubble-body）の最下部自動追従 (Issue #50)
 function scrollMascotBubbleToBottom() {
   if (!mascotBubbleText) return;
@@ -442,42 +509,63 @@ function startTypingLoop(text) {
         if (!typingTimer) mascotBubbleCursor.classList.add('hidden');
       }, 700);
 
-      // タイピング完了時に選択肢ボタンを表示 (Issue #32)
-      if (currentTypingOptions && currentTypingOptions.length > 0) {
+      // タイピング完了時に選択肢ボタンまたはアップデート通知アクションを表示 (Issue #32, #70)
+      if (currentBubbleKind === 'update') {
+        renderUpdateBubbleActions(currentUpdateBubbleVersion);
+      } else if (currentTypingOptions && currentTypingOptions.length > 0) {
         renderMascotOptions(currentTypingOptions);
       }
 
       // setting.json の bubble_display_duration_sec 秒後に自動的にフェードアウト
-      // ※選択肢がある場合は回答できるよう長めに保持 (最低180秒)
+      // ※選択肢・アップデート操作ボタンがある場合は長めに保持 (最低180秒)
       const baseSec = Math.max(1, Number(pluginSettings.bubble_display_duration_sec) || 30);
-      const bubbleDurationMs = (currentTypingOptions && currentTypingOptions.length > 0)
+      const hasInteractiveActions =
+        currentBubbleKind === 'update' || (currentTypingOptions && currentTypingOptions.length > 0);
+      const bubbleDurationMs = hasInteractiveActions
         ? Math.max(180, baseSec) * 1000
         : baseSec * 1000;
       autoHideTimer = setTimeout(() => {
-        mascotBubble.classList.add('hidden');
+        hideMascotBubble();
       }, bubbleDurationMs);
     }
   }, delay);
 }
 
 function applyMascotBubbleAppearance(kind) {
-  const isQuote = kind === 'quote';
+  const resolvedKind = (kind === 'quote' || kind === 'update') ? kind : 'message';
+  currentBubbleKind = resolvedKind;
   if (mascotBubble) {
-    mascotBubble.classList.toggle('is-quote', isQuote);
+    mascotBubble.classList.toggle('is-quote', resolvedKind === 'quote');
+    mascotBubble.classList.toggle('is-update', resolvedKind === 'update');
+    mascotBubble.title = resolvedKind === 'update'
+      ? 'クリックで配布ページを開く'
+      : 'クリックで通常画面を開く';
   }
   if (mascotBubbleTitle) {
-    mascotBubbleTitle.textContent = isQuote ? '💭 ひとりごと' : 'Muse';
+    if (resolvedKind === 'update') {
+      mascotBubbleTitle.textContent = '🔔 アップデート';
+    } else if (resolvedKind === 'quote') {
+      mascotBubbleTitle.textContent = '💭 ひとりごと';
+    } else {
+      mascotBubbleTitle.textContent = 'Muse';
+    }
   }
 }
 
 function playLupinTyping(text, options = [], meta = {}) {
   if (!mascotBubble || !mascotBubbleText) return;
-  closeMascotInput();
   const cleanedText = cleanMascotMessageText(text);
   if (!cleanedText) return;
 
-  const kind = meta && meta.kind === 'quote' ? 'quote' : 'message';
+  const kind = (meta && meta.kind) ? meta.kind : 'message';
+  if (kind === 'quote' && currentBubbleKind === 'update' && mascotBubble && !mascotBubble.classList.contains('hidden')) {
+    return;
+  }
+
+  closeMascotInput();
+  const prevKind = currentBubbleKind;
   applyMascotBubbleAppearance(kind);
+  currentUpdateBubbleVersion = kind === 'update' ? (meta.updateVersion || null) : null;
   updateMascotBubbleDirection();
 
   // シームレス追記判定 (ストリーミング途中で更新された場合のチラつき・読み直し防止):
@@ -487,7 +575,7 @@ function playLupinTyping(text, options = [], meta = {}) {
   const currentShown = mascotBubbleText.textContent || '';
   const isCurrentlyActive = !mascotBubble.classList.contains('hidden');
 
-  if (isCurrentlyActive && (
+  if (isCurrentlyActive && prevKind === kind && (
     (currentTypingTargetText && cleanedText.startsWith(currentTypingTargetText) && cleanedText.length >= currentTypingTargetText.length) ||
     (currentShown && cleanedText.startsWith(currentShown) && cleanedText.length >= currentShown.length)
   )) {
@@ -535,6 +623,30 @@ function playLupinTyping(text, options = [], meta = {}) {
   startTypingLoop(cleanedText);
 }
 
+function flushPendingUpdateBubble(delayMs = 300) {
+  if (!pendingUpdateBubbleVersion) return;
+  const nextVer = pendingUpdateBubbleVersion;
+  pendingUpdateBubbleVersion = null;
+  setTimeout(() => {
+    if (currentUpdateInfo && currentUpdateInfo.notify_enabled === false) return;
+    if (!document.body.classList.contains('mode-mascot') || isSessionVisible) {
+      pendingUpdateBubbleVersion = nextVer;
+      return;
+    }
+    if (mascotInputBar && !mascotInputBar.classList.contains('hidden')) {
+      pendingUpdateBubbleVersion = nextVer;
+      return;
+    }
+    if (mascotBubble && !mascotBubble.classList.contains('hidden')) {
+      if (currentBubbleKind === 'message') {
+        pendingUpdateBubbleVersion = nextVer;
+      }
+      return;
+    }
+    showUpdateNotificationBubble(nextVer);
+  }, delayMs);
+}
+
 function hideMascotBubble() {
   if (typingTimer) {
     clearInterval(typingTimer);
@@ -544,9 +656,12 @@ function hideMascotBubble() {
     clearTimeout(autoHideTimer);
     autoHideTimer = null;
   }
+  currentBubbleKind = 'message';
+  currentUpdateBubbleVersion = null;
   if (mascotBubble) {
     mascotBubble.classList.add('hidden');
-    mascotBubble.classList.remove('is-quote');
+    mascotBubble.classList.remove('is-quote', 'is-update');
+    mascotBubble.title = 'クリックで通常画面を開く';
   }
   if (mascotBubbleTitle) {
     mascotBubbleTitle.textContent = 'Muse';
@@ -557,6 +672,92 @@ function hideMascotBubble() {
   }
   currentTypingOptions = [];
   scheduleSyncMascotHitRects();
+  flushPendingUpdateBubble(300);
+}
+
+// ==========================================
+// アップデート通知制御 (Issue #70)
+// ==========================================
+function applyUpdateBadgeState(info) {
+  if (!info || typeof info !== 'object') return;
+  currentUpdateInfo = info;
+
+  if (avatarUpdateBadgeEl) {
+    if (info.show_badge && info.latest_version) {
+      const ver = String(info.latest_version).replace(/^v/i, '');
+      avatarUpdateBadgeEl.textContent = '↑';
+      avatarUpdateBadgeEl.title = `新しいバージョン v${ver} があります（クリックで配布ページを開く）`;
+      avatarUpdateBadgeEl.classList.remove('hidden');
+    } else {
+      avatarUpdateBadgeEl.classList.add('hidden');
+    }
+  }
+  scheduleSyncMascotHitRects();
+}
+
+function sendUpdateNotificationAction(action, version) {
+  return Promise.resolve(
+    invoke('handle_update_notification_action', {
+      action,
+      version: version || null,
+    })
+  )
+    .then((res) => {
+      if (res && typeof res === 'object' && 'show_badge' in res) {
+        applyUpdateBadgeState(res);
+      }
+      return res;
+    })
+    .catch(() => null);
+}
+
+function showUpdateNotificationBubble(version) {
+  const ver = String(version || '').replace(/^v/i, '').trim();
+  if (!ver) return;
+
+  sendUpdateNotificationAction('shown', ver);
+
+  playLupinTyping(`新しいバージョン v${ver} が出てるよ！`, [], {
+    kind: 'update',
+    updateVersion: ver,
+  });
+}
+
+async function checkForAppUpdate(forceCheck = false) {
+  if (isCheckingAppUpdate) return null;
+  isCheckingAppUpdate = true;
+  try {
+    const info = await invoke('check_for_app_update', { forceCheck });
+    if (!info || typeof info !== 'object') return null;
+
+    applyUpdateBadgeState(info);
+
+    if (info.show_bubble && info.latest_version) {
+      const ver = String(info.latest_version).replace(/^v/i, '').trim();
+      if (ver) {
+        const isBubbleVisible = !!(mascotBubble && !mascotBubble.classList.contains('hidden'));
+        if (isBubbleVisible && currentBubbleKind === 'update' && currentUpdateBubbleVersion === ver) {
+          // 既に同一バージョンの通知吹き出しを表示中の場合は再描画しない
+        } else if (isBubbleVisible && currentBubbleKind === 'message') {
+          pendingUpdateBubbleVersion = ver;
+        } else if (
+          !document.body.classList.contains('mode-mascot') ||
+          isSessionVisible ||
+          (mascotInputBar && !mascotInputBar.classList.contains('hidden'))
+        ) {
+          pendingUpdateBubbleVersion = ver;
+        } else {
+          showUpdateNotificationBubble(ver);
+        }
+      }
+    }
+    return info;
+  } catch (err) {
+    console.warn('checkForAppUpdate error:', err);
+    return null;
+  } finally {
+    isCheckingAppUpdate = false;
+  }
 }
 
 // ==========================================
@@ -675,6 +876,7 @@ function closeMascotInput() {
   try {
     window.focus();
   } catch (_) {}
+  flushPendingUpdateBubble(300);
 }
 
 function toggleMascotInput() {
@@ -1744,7 +1946,10 @@ async function syncAvatarStateWithMuse() {
 
       // ステータスピル更新: 「リンク済み」「待機中」等の待機テキストやアバター名そのものは表示しない (Issue #35, #57)
       if (avatarStatusPillEl && avatarStatusTextEl) {
-        const currentAvatarName = (avatarNameEl?.textContent || '').trim().toLowerCase();
+        const nameSourceEl = (avatarNameTextEl && avatarNameEl && avatarNameEl.contains(avatarNameTextEl))
+          ? avatarNameTextEl
+          : avatarNameEl;
+        const currentAvatarName = (nameSourceEl?.textContent || '').trim().toLowerCase();
         const normalizedStatus = statusText.replace(/^(\p{Emoji}|[\u2600-\u27BF]|\s)+/gu, '').trim().toLowerCase();
         const isAvatarNameOnly = Boolean(currentAvatarName) && normalizedStatus === currentAvatarName;
         const effectiveStatusText = isAvatarNameOnly ? '' : statusText;
@@ -2187,6 +2392,8 @@ async function loadUsageLimit(forceRefresh = false, options = {}) {
       await recoverSessionAndRefetchLimit('usage_limit_consecutive_failure');
     }
   }
+
+  checkForAppUpdate(false);
 }
 
 // ==========================================
@@ -2288,6 +2495,7 @@ function applySizeMode(mode) {
   if (mode === 'mascot') {
     document.body.classList.add('mode-mascot');
     scheduleSyncMascotHitRects();
+    flushPendingUpdateBubble(300);
   } else if (mode === 'large') {
     document.body.classList.add('mode-large');
     hideMascotBubble();
@@ -2326,6 +2534,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   if (avatarNameEl) {
     let nameMouseDownPos = null;
     avatarNameEl.addEventListener('pointerdown', (e) => {
+      if (e.target && e.target.closest && e.target.closest('#avatar-update-badge')) return;
       if (e.button !== 0) return;
       nameMouseDownPos = { x: e.screenX, y: e.screenY, time: Date.now() };
     });
@@ -2344,6 +2553,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     });
 
     avatarNameEl.addEventListener('pointerup', (e) => {
+      if (e.target && e.target.closest && e.target.closest('#avatar-update-badge')) return;
       if (!nameMouseDownPos) return;
       const dist = Math.hypot(e.screenX - nameMouseDownPos.x, e.screenY - nameMouseDownPos.y);
       const elapsed = Date.now() - nameMouseDownPos.time;
@@ -2356,6 +2566,20 @@ window.addEventListener('DOMContentLoaded', async () => {
         setTimeout(() => avatarNameEl.classList.remove('refreshing'), 600);
         loadUsageLimit(true);
       }
+    });
+  }
+
+  // アップデート通知バッジクリック（配布ページを開く）(Issue #70)
+  if (avatarUpdateBadgeEl) {
+    avatarUpdateBadgeEl.addEventListener('pointerdown', (e) => {
+      e.stopPropagation();
+    });
+    avatarUpdateBadgeEl.addEventListener('pointerup', (e) => {
+      e.stopPropagation();
+    });
+    avatarUpdateBadgeEl.addEventListener('click', (e) => {
+      e.stopPropagation();
+      invoke('open_release_page').catch(console.error);
     });
   }
 
@@ -2449,10 +2673,16 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (document.hidden) clearMascotHoverState();
   });
 
-  // 吹き出しクリック（通常画面へ復帰）
+  // 吹き出しクリック（アップデート通知時は配布ページを開く、通常時は通常画面へ復帰）
   if (mascotBubble) {
     mascotBubble.addEventListener('click', (e) => {
-      if (e.target.closest('#btn-bubble-close')) return;
+      if (e.target?.closest?.('#btn-bubble-close') || e.target?.closest?.('#mascot-bubble-options')) return;
+      if (currentBubbleKind === 'update') {
+        const ver = currentUpdateBubbleVersion || currentUpdateInfo?.latest_version || null;
+        hideMascotBubble();
+        sendUpdateNotificationAction('open', ver);
+        return;
+      }
       restoreFromMascot();
     });
   }
@@ -2461,6 +2691,10 @@ window.addEventListener('DOMContentLoaded', async () => {
   if (btnBubbleClose) {
     btnBubbleClose.addEventListener('click', (e) => {
       e.stopPropagation();
+      if (currentBubbleKind === 'update') {
+        const ver = currentUpdateBubbleVersion || currentUpdateInfo?.latest_version || null;
+        sendUpdateNotificationAction('dismiss', ver);
+      }
       hideMascotBubble();
     });
   }
@@ -2614,6 +2848,7 @@ window.addEventListener('DOMContentLoaded', async () => {
       } else {
         // セッション画面からマスコット画面に戻った瞬間、最新の利用枠を自動取得 (Issue #33)
         loadUsageLimit(true);
+        flushPendingUpdateBubble(300);
       }
     });
     // GUI設定画面で設定が保存された際のホットリロード即時反映 (Issue #13)
@@ -2630,6 +2865,19 @@ window.addEventListener('DOMContentLoaded', async () => {
       console.info('[SessionRecovery] session-reloaded event', payload);
       if (!isReloadingSession && payload.executed && payload.ready) {
         loadUsageLimit(true, { skipFallbackReload: true });
+      }
+    });
+    // アップデート通知設定変更イベントを受信 (Issue #70)
+    window.__TAURI__.event.listen('update-notify-config-changed', (event) => {
+      const payload = event?.payload;
+      if (payload && typeof payload === 'object') {
+        applyUpdateBadgeState(payload);
+        if (!payload.notify_enabled) {
+          pendingUpdateBubbleVersion = null;
+          if (currentBubbleKind === 'update') {
+            hideMascotBubble();
+          }
+        }
       }
     });
   }
@@ -2699,6 +2947,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   // ネームプレートクリックで利用枠を手動再取得＆最新化
   if (avatarNameEl) {
     avatarNameEl.addEventListener('click', (e) => {
+      if (e.target && e.target.closest && e.target.closest('#avatar-update-badge')) return;
       e.stopPropagation();
       loadUsageLimit(true);
     });

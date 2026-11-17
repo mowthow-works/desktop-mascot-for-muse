@@ -122,6 +122,12 @@ async fn acquire_bridge_lock() -> BridgeLockGuard {
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0";
 const SESSION_URL: &str = "https://muse.ai/?__pwa=1";
 const BROWSER_URL: &str = "https://muse.ai";
+const RELEASES_ATOM_URL: &str = "https://github.com/mowthow-works/desktop-mascot-for-muse/releases.atom";
+const RELEASE_DISTRIBUTION_URL: &str = "https://mowthow-works.com/desktop-mascot-for-muse/";
+const UPDATE_CHECK_INTERVAL_SEC: i64 = 6 * 3600;
+const UPDATE_RETRY_COOLDOWN_SEC: i64 = 30 * 60;
+const UPDATE_SNOOZE_DURATION_SEC: i64 = 24 * 3600;
+static LAST_UPDATE_ATTEMPT_EPOCH: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 const SMALL_WIDTH: f64 = 360.0;
 const SMALL_HEIGHT: f64 = 580.0;
@@ -163,6 +169,21 @@ fn default_mascot_bubble_on_left() -> bool {
     true
 }
 
+fn default_update_notify_enabled() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct UpdateCheckResponse {
+    pub update_available: bool,
+    pub current_version: String,
+    pub latest_version: Option<String>,
+    pub show_badge: bool,
+    pub show_bubble: bool,
+    pub distribution_url: String,
+    pub notify_enabled: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct GadgetConfig {
     pub size_mode: String, // "small", "large", or "mascot"
@@ -189,6 +210,18 @@ pub struct GadgetConfig {
     pub session_size: Option<(f64, f64)>,
     #[serde(default)]
     pub autostart_enabled: Option<bool>,
+    #[serde(default = "default_update_notify_enabled")]
+    pub update_notify_enabled: bool,
+    #[serde(default)]
+    pub update_last_checked_epoch: Option<i64>,
+    #[serde(default)]
+    pub update_latest_version: Option<String>,
+    #[serde(default)]
+    pub update_notified_version: Option<String>,
+    #[serde(default)]
+    pub update_skipped_version: Option<String>,
+    #[serde(default)]
+    pub update_snooze_until_epoch: Option<i64>,
 }
 
 impl Default for GadgetConfig {
@@ -208,6 +241,12 @@ impl Default for GadgetConfig {
             session_pos: None,
             session_size: None,
             autostart_enabled: None,
+            update_notify_enabled: default_update_notify_enabled(),
+            update_last_checked_epoch: None,
+            update_latest_version: None,
+            update_notified_version: None,
+            update_skipped_version: None,
+            update_snooze_until_epoch: None,
         }
     }
 }
@@ -2542,6 +2581,344 @@ fn close_window(app: AppHandle) {
     app.exit(0);
 }
 
+pub fn parse_stable_semver(tag_or_ver: &str) -> Option<(u64, u64, u64)> {
+    let trimmed = tag_or_ver.trim();
+    let stripped = trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
+    if stripped.is_empty() || stripped.contains('-') || stripped.contains('+') {
+        return None;
+    }
+    let mut parts = stripped.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+pub fn normalize_semver_str(tag_or_ver: &str) -> Option<String> {
+    parse_stable_semver(tag_or_ver).map(|(ma, mi, pa)| format!("{}.{}.{}", ma, mi, pa))
+}
+
+pub fn is_newer_semver(current: &str, candidate: &str) -> bool {
+    match (parse_stable_semver(current), parse_stable_semver(candidate)) {
+        (Some(cur), Some(cand)) => cand > cur,
+        _ => false,
+    }
+}
+
+fn find_next_tag_block<'a>(xml: &'a str, tag_name: &str) -> Option<(&'a str, &'a str)> {
+    let open_prefix = format!("<{}", tag_name);
+    let close_tag = format!("</{}>", tag_name);
+    let mut search_from = 0usize;
+    while let Some(rel_start) = xml[search_from..].find(&open_prefix) {
+        let start = search_from + rel_start;
+        let after_name = &xml[start + open_prefix.len()..];
+        match after_name.chars().next() {
+            Some(c) if c == '>' || c.is_whitespace() => {
+                let gt_rel = after_name.find('>')?;
+                let content_start = start + open_prefix.len() + gt_rel + 1;
+                if gt_rel > 0 && after_name.as_bytes()[gt_rel - 1] == b'/' {
+                    search_from = content_start;
+                    continue;
+                }
+                let end_rel = xml[content_start..].find(&close_tag)?;
+                let content_end = content_start + end_rel;
+                let rest = &xml[content_end + close_tag.len()..];
+                return Some((&xml[content_start..content_end], rest));
+            }
+            _ => {
+                search_from = start + open_prefix.len();
+            }
+        }
+    }
+    None
+}
+
+fn is_prerelease_or_build_semver(candidate: &str) -> bool {
+    let trimmed = candidate.trim();
+    if let Some((base, _)) = trimmed.split_once(['-', '+']) {
+        parse_stable_semver(base).is_some()
+    } else {
+        false
+    }
+}
+
+pub fn extract_latest_stable_version_from_atom(atom_xml: &str) -> Option<String> {
+    let mut best: Option<(u64, u64, u64)> = None;
+    let mut rest = atom_xml;
+
+    while let Some((entry, next_rest)) = find_next_tag_block(rest, "entry") {
+        rest = next_rest;
+
+        // 1) /releases/tag/ の直後から " / ? / < / / まで
+        let tag_cand = entry.find("/releases/tag/").map(|idx| {
+            let after = &entry[idx + "/releases/tag/".len()..];
+            let end = after
+                .find(|c: char| matches!(c, '"' | '\'' | '?' | '<' | '/') || c.is_whitespace())
+                .unwrap_or(after.len());
+            after[..end].trim()
+        });
+        if let Some(cand) = tag_cand {
+            if let Some(ver) = parse_stable_semver(cand) {
+                best = Some(best.map_or(ver, |b| b.max(ver)));
+                continue;
+            }
+            if is_prerelease_or_build_semver(cand) {
+                continue;
+            }
+        }
+
+        // 2) <id> タグ内の最後の / から </id> まで
+        let id_cand = find_next_tag_block(entry, "id").and_then(|(id_inner, _)| {
+            id_inner.rfind('/').map(|pos| id_inner[pos + 1..].trim())
+        });
+        if let Some(cand) = id_cand {
+            if let Some(ver) = parse_stable_semver(cand) {
+                best = Some(best.map_or(ver, |b| b.max(ver)));
+                continue;
+            }
+            if is_prerelease_or_build_semver(cand) {
+                continue;
+            }
+        }
+
+        // 3) <title> タグ内の最初の空白までのトークン
+        let title_cand = find_next_tag_block(entry, "title")
+            .and_then(|(title_inner, _)| title_inner.trim().split_whitespace().next());
+        if let Some(cand) = title_cand {
+            if let Some(ver) = parse_stable_semver(cand) {
+                best = Some(best.map_or(ver, |b| b.max(ver)));
+            }
+        }
+    }
+
+    best.map(|(ma, mi, pa)| format!("{}.{}.{}", ma, mi, pa))
+}
+
+pub fn evaluate_update_status(
+    cfg: &GadgetConfig,
+    current_version: &str,
+    now_epoch: i64,
+) -> UpdateCheckResponse {
+    let cur_norm = normalize_semver_str(current_version).unwrap_or_else(|| {
+        let trimmed = current_version.trim();
+        trimmed
+            .strip_prefix('v')
+            .or_else(|| trimmed.strip_prefix('V'))
+            .unwrap_or(trimmed)
+            .to_string()
+    });
+    let latest_norm = cfg
+        .update_latest_version
+        .as_deref()
+        .and_then(normalize_semver_str);
+    let update_available = latest_norm
+        .as_deref()
+        .map(|lat| is_newer_semver(&cur_norm, lat))
+        .unwrap_or(false);
+
+    let (show_badge, show_bubble) = if !cfg.update_notify_enabled || !update_available {
+        (false, false)
+    } else {
+        let notified_norm = cfg
+            .update_notified_version
+            .as_deref()
+            .and_then(normalize_semver_str);
+        let skipped_norm = cfg
+            .update_skipped_version
+            .as_deref()
+            .and_then(normalize_semver_str);
+        let notified_same = latest_norm.is_some() && notified_norm == latest_norm;
+        let skipped_same = latest_norm.is_some() && skipped_norm == latest_norm;
+        let snoozed = cfg
+            .update_snooze_until_epoch
+            .map(|u| now_epoch < u)
+            .unwrap_or(false);
+        (true, !notified_same && !skipped_same && !snoozed)
+    };
+
+    UpdateCheckResponse {
+        update_available,
+        current_version: cur_norm,
+        latest_version: latest_norm,
+        show_badge,
+        show_bubble,
+        distribution_url: RELEASE_DISTRIBUTION_URL.to_string(),
+        notify_enabled: cfg.update_notify_enabled,
+    }
+}
+
+fn should_fetch_update(
+    cfg: &GadgetConfig,
+    force_check: Option<bool>,
+    now_epoch: i64,
+    last_attempt_epoch: i64,
+) -> bool {
+    if !cfg.update_notify_enabled {
+        return false;
+    }
+    if force_check == Some(true) {
+        return true;
+    }
+    let elapsed_ok = cfg
+        .update_last_checked_epoch
+        .map(|last| now_epoch.saturating_sub(last) >= UPDATE_CHECK_INTERVAL_SEC)
+        .unwrap_or(true);
+    let cooldown_ok = last_attempt_epoch <= 0
+        || now_epoch.saturating_sub(last_attempt_epoch) >= UPDATE_RETRY_COOLDOWN_SEC;
+    elapsed_ok && cooldown_ok
+}
+
+fn apply_update_notification_action_to_config(
+    cfg: &mut GadgetConfig,
+    action: &str,
+    version: Option<&str>,
+    now_epoch: i64,
+) {
+    let target_ver = version
+        .and_then(normalize_semver_str)
+        .or_else(|| cfg.update_latest_version.as_deref().and_then(normalize_semver_str));
+
+    match action {
+        "shown" | "dismiss" | "open" => {
+            if let Some(v) = target_ver {
+                cfg.update_notified_version = Some(v);
+            }
+        }
+        "skip" => {
+            if let Some(v) = target_ver {
+                cfg.update_notified_version = Some(v.clone());
+                cfg.update_skipped_version = Some(v);
+            }
+        }
+        "snooze" => {
+            cfg.update_snooze_until_epoch = Some(now_epoch + UPDATE_SNOOZE_DURATION_SEC);
+            if let Some(ref tv) = target_ver {
+                if cfg
+                    .update_notified_version
+                    .as_deref()
+                    .and_then(normalize_semver_str)
+                    .as_deref()
+                    == Some(tv.as_str())
+                {
+                    cfg.update_notified_version = None;
+                }
+                if cfg
+                    .update_skipped_version
+                    .as_deref()
+                    .and_then(normalize_semver_str)
+                    .as_deref()
+                    == Some(tv.as_str())
+                {
+                    cfg.update_skipped_version = None;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn fetch_releases_atom_xml() -> Result<String, String> {
+    let mut cmd = std::process::Command::new("curl.exe");
+    cmd.args(["-sSL", "--max-time", "10", RELEASES_ATOM_URL]);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Failed to execute curl.exe: {}", e))?;
+    if !output.status.success() {
+        return Err(format!("curl.exe exited with status: {}", output.status));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|e| format!("Invalid UTF-8 in releases atom response: {}", e))
+}
+
+#[tauri::command]
+async fn check_for_app_update(
+    app: AppHandle,
+    force_check: Option<bool>,
+) -> Result<UpdateCheckResponse, String> {
+    let now_epoch = chrono::Utc::now().timestamp();
+    let mut cfg = load_config_internal(&app);
+    let last_attempt = LAST_UPDATE_ATTEMPT_EPOCH.load(Ordering::Relaxed);
+
+    if should_fetch_update(&cfg, force_check, now_epoch, last_attempt) {
+        LAST_UPDATE_ATTEMPT_EPOCH.store(now_epoch, Ordering::SeqCst);
+        if let Ok(Ok(xml)) = tokio::task::spawn_blocking(fetch_releases_atom_xml).await {
+            if let Some(latest_ver) = extract_latest_stable_version_from_atom(&xml) {
+                let checked_epoch = chrono::Utc::now().timestamp();
+                cfg = update_config_internal(&app, |c| {
+                    c.update_last_checked_epoch = Some(checked_epoch);
+                    c.update_latest_version = Some(latest_ver);
+                });
+                return Ok(evaluate_update_status(
+                    &cfg,
+                    env!("CARGO_PKG_VERSION"),
+                    checked_epoch,
+                ));
+            }
+        }
+        cfg = load_config_internal(&app);
+    }
+
+    Ok(evaluate_update_status(
+        &cfg,
+        env!("CARGO_PKG_VERSION"),
+        now_epoch,
+    ))
+}
+
+#[tauri::command]
+async fn handle_update_notification_action(
+    app: AppHandle,
+    action: String,
+    version: Option<String>,
+) -> Result<UpdateCheckResponse, String> {
+    let now_epoch = chrono::Utc::now().timestamp();
+    let cfg = update_config_internal(&app, |c| {
+        apply_update_notification_action_to_config(c, &action, version.as_deref(), now_epoch);
+    });
+    if action == "open" {
+        spawn_open_external_url(&app, "open_release_distribution_url", RELEASE_DISTRIBUTION_URL);
+    }
+    Ok(evaluate_update_status(
+        &cfg,
+        env!("CARGO_PKG_VERSION"),
+        now_epoch,
+    ))
+}
+
+#[tauri::command]
+async fn open_release_page(app: AppHandle) -> Result<(), String> {
+    spawn_open_external_url(&app, "open_release_distribution_url", RELEASE_DISTRIBUTION_URL);
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_update_notify_enabled(
+    app: AppHandle,
+    enabled: bool,
+) -> Result<UpdateCheckResponse, String> {
+    let now_epoch = chrono::Utc::now().timestamp();
+    let cfg = update_config_internal(&app, |c| {
+        c.update_notify_enabled = enabled;
+    });
+    let status = evaluate_update_status(&cfg, env!("CARGO_PKG_VERSION"), now_epoch);
+    if let Some(main_win) = app.get_webview_window("main") {
+        let _ = main_win.emit("update-notify-config-changed", &status);
+    }
+    Ok(status)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AutostartReconcilePlan {
     desired_enabled: bool,
@@ -3000,7 +3377,11 @@ pub fn run() {
             get_session_status,
             drag_window,
             minimize_window,
-            close_window
+            close_window,
+            check_for_app_update,
+            handle_update_notification_action,
+            open_release_page,
+            set_update_notify_enabled
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -3082,6 +3463,12 @@ mod tests {
         assert_eq!(def.avatar_name, "ラッキー");
         assert_eq!(def.mascot_scale, "standard");
         assert!(def.mascot_bubble_on_left);
+        assert!(def.update_notify_enabled);
+        assert!(def.update_last_checked_epoch.is_none());
+        assert!(def.update_latest_version.is_none());
+        assert!(def.update_notified_version.is_none());
+        assert!(def.update_skipped_version.is_none());
+        assert!(def.update_snooze_until_epoch.is_none());
 
         // 旧バージョンの設定JSON（新規フィールド欠落）からのデシリアライズ互換性検証
         let legacy_json = r#"{
@@ -3098,6 +3485,12 @@ mod tests {
         assert_eq!(parsed.mascot_scale, "standard");
         assert!(parsed.mascot_bubble_on_left);
         assert!(parsed.mascot_pos.is_none());
+        assert!(parsed.update_notify_enabled);
+        assert!(parsed.update_last_checked_epoch.is_none());
+        assert!(parsed.update_latest_version.is_none());
+        assert!(parsed.update_notified_version.is_none());
+        assert!(parsed.update_skipped_version.is_none());
+        assert!(parsed.update_snooze_until_epoch.is_none());
     }
 
     #[test]
@@ -3417,5 +3810,185 @@ mod tests {
         assert!(is_cursor_in_hit_rects((850.0, 250.0), (100, 100), 1.5, &rects));
         // 高DPI (1.5x): 物理 (100 + 200*1.5, 100 + 100*1.5) = (400, 250) -> ローカル (200, 100) は透過
         assert!(!is_cursor_in_hit_rects((400.0, 250.0), (100, 100), 1.5, &rects));
+    }
+
+    #[test]
+    fn test_parse_stable_semver_and_is_newer_semver() {
+        assert_eq!(parse_stable_semver("1.1.11"), Some((1, 1, 11)));
+        assert_eq!(parse_stable_semver("v1.2.0"), Some((1, 2, 0)));
+        assert_eq!(parse_stable_semver(" V2.10.3 "), Some((2, 10, 3)));
+
+        // プレリリース / ビルドメタデータ / 不正形式は None
+        assert_eq!(parse_stable_semver("v1.2.0-beta.1"), None);
+        assert_eq!(parse_stable_semver("1.2.0-rc.1"), None);
+        assert_eq!(parse_stable_semver("1.2.0+build.5"), None);
+        assert_eq!(parse_stable_semver("v1.2"), None);
+        assert_eq!(parse_stable_semver("1.2.3.4"), None);
+        assert_eq!(parse_stable_semver(""), None);
+        assert_eq!(parse_stable_semver("invalid"), None);
+
+        assert_eq!(normalize_semver_str(" v1.2.3 "), Some("1.2.3".to_string()));
+        assert_eq!(normalize_semver_str("v1.2.3-rc.1"), None);
+
+        // バージョン比較
+        assert!(is_newer_semver("1.1.11", "1.1.12"));
+        assert!(is_newer_semver("1.1.9", "v1.1.10"));
+        assert!(is_newer_semver("v1.1.11", "1.2.0"));
+        assert!(!is_newer_semver("1.1.11", "v1.1.11"));
+        assert!(!is_newer_semver("1.2.0", "1.1.11"));
+        assert!(!is_newer_semver("1.1.11", "1.2.0-beta.1"));
+        assert!(!is_newer_semver("1.1.11", "1.2.0-rc.1"));
+    }
+
+    #[test]
+    fn test_extract_latest_stable_version_from_atom() {
+        let atom_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Release notes from desktop-mascot-for-muse</title>
+  <entry>
+    <id>tag:github.com,2008:Repository/12345/v1.3.0-beta.1</id>
+    <link rel="alternate" type="text/html" href="https://github.com/mowthow-works/desktop-mascot-for-muse/releases/tag/v1.3.0-beta.1"/>
+    <title>v1.3.0 Beta 1</title>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/12345/v1.2.1-rc.1</id>
+    <link rel="alternate" type="text/html" href="https://github.com/mowthow-works/desktop-mascot-for-muse/releases/tag/v1.2.1-rc.1"/>
+    <title>v1.2.1-rc.1</title>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/12345/v1.1.11</id>
+    <link rel="alternate" type="text/html" href="https://github.com/mowthow-works/desktop-mascot-for-muse/releases/tag/v1.1.11"/>
+    <title>v1.1.11</title>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/12345/v1.2.0</id>
+    <link rel="alternate" type="text/html" href="https://github.com/mowthow-works/desktop-mascot-for-muse/releases/tag/v1.2.0"/>
+    <title>v1.2.0 Release</title>
+  </entry>
+</feed>"#;
+        assert_eq!(
+            extract_latest_stable_version_from_atom(atom_xml),
+            Some("1.2.0".to_string())
+        );
+
+        // クエリ付き / <id> フォールバック / <title> フォールバック
+        let fallback_xml = r#"<feed>
+  <entry>
+    <id>urn:uuid:1111</id>
+    <title>v1.2.5 リリースのお知らせ</title>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Repository/12345/v1.3.1</id>
+    <title>Release 1.3.1</title>
+  </entry>
+  <entry>
+    <link href="https://github.com/org/repo/releases/tag/v1.4.2/?src=atom"/>
+    <title>Latest</title>
+  </entry>
+</feed>"#;
+        assert_eq!(
+            extract_latest_stable_version_from_atom(fallback_xml),
+            Some("1.4.2".to_string())
+        );
+
+        // プレリリースのみの場合は None
+        let prerelease_only = r#"<feed>
+  <entry>
+    <id>tag:github.com,2008:Repository/12345/v2.0.0-alpha.1</id>
+    <link href="https://github.com/org/repo/releases/tag/v2.0.0-alpha.1"/>
+    <title>v2.0.0-alpha.1</title>
+  </entry>
+</feed>"#;
+        assert_eq!(extract_latest_stable_version_from_atom(prerelease_only), None);
+        assert_eq!(extract_latest_stable_version_from_atom(""), None);
+    }
+
+    #[test]
+    fn test_evaluate_update_status_and_notification_actions() {
+        let now = 1_700_000_000i64;
+        let mut cfg = GadgetConfig::default();
+        cfg.update_latest_version = Some("1.2.0".to_string());
+
+        // 初期状態: バッジも吹き出しも表示
+        let st1 = evaluate_update_status(&cfg, "1.1.11", now);
+        assert!(st1.update_available);
+        assert_eq!(st1.current_version, "1.1.11");
+        assert_eq!(st1.latest_version, Some("1.2.0".to_string()));
+        assert!(st1.show_badge);
+        assert!(st1.show_bubble);
+        assert_eq!(st1.distribution_url, RELEASE_DISTRIBUTION_URL);
+        assert!(st1.notify_enabled);
+
+        // shown 後: バッジは残るが吹き出しは抑制
+        apply_update_notification_action_to_config(&mut cfg, "shown", Some("v1.2.0"), now);
+        let st2 = evaluate_update_status(&cfg, "1.1.11", now + 10);
+        assert!(st2.show_badge);
+        assert!(!st2.show_bubble);
+
+        // snooze: 24時間以内は吹き出し非表示、24時間経過後は再表示
+        apply_update_notification_action_to_config(&mut cfg, "snooze", Some("1.2.0"), now);
+        assert!(cfg.update_notified_version.is_none());
+        let st_snoozed = evaluate_update_status(&cfg, "1.1.11", now + 3600);
+        assert!(st_snoozed.show_badge);
+        assert!(!st_snoozed.show_bubble);
+
+        let st_after_24h = evaluate_update_status(&cfg, "1.1.11", now + UPDATE_SNOOZE_DURATION_SEC);
+        assert!(st_after_24h.show_badge);
+        assert!(st_after_24h.show_bubble);
+
+        // skip: 同一バージョンは非表示、さらに新しいバージョン(1.3.0)が出たら再表示
+        apply_update_notification_action_to_config(&mut cfg, "skip", Some("1.2.0"), now);
+        let st_skipped = evaluate_update_status(&cfg, "1.1.11", now + UPDATE_SNOOZE_DURATION_SEC + 10);
+        assert!(st_skipped.show_badge);
+        assert!(!st_skipped.show_bubble);
+
+        cfg.update_latest_version = Some("1.3.0".to_string());
+        let st_newer = evaluate_update_status(&cfg, "1.1.11", now + UPDATE_SNOOZE_DURATION_SEC + 10);
+        assert!(st_newer.show_badge);
+        assert!(st_newer.show_bubble);
+
+        // 設定 OFF で両方 false
+        cfg.update_notify_enabled = false;
+        let st_off = evaluate_update_status(&cfg, "1.1.11", now + UPDATE_SNOOZE_DURATION_SEC + 10);
+        assert!(st_off.update_available);
+        assert!(!st_off.show_badge);
+        assert!(!st_off.show_bubble);
+        assert!(!st_off.notify_enabled);
+
+        // 同等または旧バージョンなら update_available = false
+        cfg.update_notify_enabled = true;
+        cfg.update_latest_version = Some("1.1.11".to_string());
+        let st_same = evaluate_update_status(&cfg, "1.1.11", now);
+        assert!(!st_same.update_available);
+        assert!(!st_same.show_badge);
+        assert!(!st_same.show_bubble);
+    }
+
+    #[test]
+    fn test_should_fetch_update_intervals_and_force() {
+        let now = 1_700_000_000i64;
+        let mut cfg = GadgetConfig::default();
+
+        // 初回（未チェック・未試行）は取得する
+        assert!(should_fetch_update(&cfg, None, now, 0));
+
+        // 前回チェックから6時間未満はスキップ
+        cfg.update_last_checked_epoch = Some(now - (UPDATE_CHECK_INTERVAL_SEC - 1));
+        assert!(!should_fetch_update(&cfg, None, now, 0));
+
+        // 6時間以上経過しても失敗クールダウン（30分未満）中はスキップ
+        cfg.update_last_checked_epoch = Some(now - UPDATE_CHECK_INTERVAL_SEC);
+        assert!(!should_fetch_update(&cfg, None, now, now - (UPDATE_RETRY_COOLDOWN_SEC - 1)));
+
+        // 両方経過すれば取得する
+        assert!(should_fetch_update(&cfg, None, now, now - UPDATE_RETRY_COOLDOWN_SEC));
+
+        // force_check = true は間隔・クールダウンを無視して取得
+        cfg.update_last_checked_epoch = Some(now - 5);
+        assert!(should_fetch_update(&cfg, Some(true), now, now - 5));
+
+        // 通知設定 OFF 時は強制チェックでも取得しない
+        cfg.update_notify_enabled = false;
+        assert!(!should_fetch_update(&cfg, Some(true), now, 0));
     }
 }
