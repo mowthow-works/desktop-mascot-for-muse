@@ -617,4 +617,143 @@ describe('session_bridge.js DOM Scraping & Guardrails Suite', () => {
     expect(res.used_percent).toBe(29);
     expect(res.remaining_percent).toBe(71);
   });
+
+  it('scanDomForLimit / fetchUsageLimit (Issue #71): チャット本文や設定外プログレスバーを誤抽出せず設定モーダルから正しく取得する', async () => {
+    let settingsClicked = false;
+    document.body.innerHTML = `
+      <main>
+        <div class="group/msg">
+          <div class="prose">
+            <p>現在の表示では 93%使用済み（残り 7%）になっています。</p>
+            <p>リセット → 残量は 99% が正解</p>
+            <div role="progressbar" aria-valuenow="93"></div>
+          </div>
+        </div>
+        <div class="upload-progress" role="progressbar" aria-valuenow="93"></div>
+        <button aria-label="設定" id="btn-settings">設定</button>
+        <textarea placeholder="メッセージを入力"></textarea>
+      </main>
+    `;
+    Object.defineProperty(document.body, 'innerText', {
+      value: '93%使用済み\n残り 7%\nリセット → 残量は 99% が正解',
+      configurable: true,
+    });
+
+    // チャット画面の段階では設定外 DOM を一切拾わず null を返すこと
+    expect(window.__MUSE_BRIDGE__.scanDomForLimit()).toBeNull();
+
+    document.getElementById('btn-settings').addEventListener('click', () => {
+      settingsClicked = true;
+      const modal = document.createElement('div');
+      modal.setAttribute('role', 'dialog');
+      modal.innerHTML = `
+        <button role="tab" id="tab-general">一般</button>
+        <button aria-label="閉じる" id="btn-close">×</button>
+      `;
+      document.body.appendChild(modal);
+      document.getElementById('tab-general').addEventListener('click', () => {
+        const panel = document.createElement('div');
+        panel.innerHTML = `
+          <span class="text-body text-text-primary">無料プラン</span>
+          <div>1%使用済み</div>
+          <div>1週間の上限は11月28日にリセットされます</div>
+        `;
+        modal.appendChild(panel);
+      });
+      document.getElementById('btn-close').addEventListener('click', () => modal.remove());
+    });
+
+    const res = await window.__MUSE_BRIDGE__.fetchUsageLimit(false, {
+      pollIntervalMs: 10,
+      maxTabWaitMs: 80,
+      maxLimitWaitMs: 80,
+      closeWaitMs: 10,
+      navWaitMs: 10,
+    });
+    expect(settingsClicked).toBe(true);
+    expect(res.plan_name).toBe('無料プラン');
+    expect(res.used_percent).toBe(1);
+    expect(res.remaining_percent).toBe(99);
+    expect(res.reset_text).toBe('1週間の上限は11月28日にリセットされます');
+  });
+
+  it('scanDomForLimit (Issue #71): 明示テキストをプログレスバーより優先し、フォールバック時は親要素のラベルを正しく判定する', () => {
+    // 1. ダイアログ内に明示テキストと別値のプログレスバーが共存する場合、明示テキストを優先
+    document.body.innerHTML = `
+      <div role="dialog">
+        <span class="text-body text-text-primary">無料プラン</span>
+        <div role="progressbar" aria-valuenow="7"></div>
+        <div>1%使用済み</div>
+        <div>1週間の上限は11月28日にリセットされます</div>
+      </div>
+    `;
+    const explicitRes = window.__MUSE_BRIDGE__.scanDomForLimit();
+    expect(explicitRes).not.toBeNull();
+    expect(explicitRes.used_percent).toBe(1);
+    expect(explicitRes.remaining_percent).toBe(99);
+
+    // 2. 明示テキストが無い場合はプログレスバーへフォールバックし、bar自身ではなく親要素の「残り」を判定する
+    document.body.innerHTML = `
+      <div role="dialog">
+        <span class="text-body text-text-primary">無料プラン</span>
+        <div class="usage-box">
+          <span>残り</span>
+          <div role="progressbar" aria-valuenow="99"></div>
+        </div>
+      </div>
+    `;
+    const fallbackRes = window.__MUSE_BRIDGE__.scanDomForLimit();
+    expect(fallbackRes).not.toBeNull();
+    expect(fallbackRes.remaining_percent).toBe(99);
+    expect(fallbackRes.used_percent).toBe(1);
+  });
+
+  it('fetchUsageLimit (Issue #71): ダイアログ外の「閉じる」ボタンをダイアログ開状態と誤判定しない', async () => {
+    let settingsClicked = false;
+    document.body.innerHTML = `
+      <aside>
+        <button aria-label="閉じる" id="btn-sidebar-close">×</button>
+      </aside>
+      <main>
+        <button aria-label="設定" id="btn-settings">設定</button>
+        <textarea placeholder="メッセージを入力"></textarea>
+      </main>
+    `;
+
+    document.getElementById('btn-settings').addEventListener('click', () => {
+      settingsClicked = true;
+      const modal = document.createElement('div');
+      modal.setAttribute('role', 'dialog');
+      modal.innerHTML = `
+        <button role="tab" id="tab-general">一般</button>
+        <button aria-label="閉じる" id="btn-close">×</button>
+      `;
+      document.body.appendChild(modal);
+      document.getElementById('tab-general').addEventListener('click', () => {
+        const panel = document.createElement('div');
+        panel.innerHTML = `
+          <span class="text-body text-text-primary">無料プラン</span>
+          <div>1%使用済み</div>
+          <div>1週間の上限は11月28日にリセットされます</div>
+        `;
+        modal.appendChild(panel);
+      });
+      document.getElementById('btn-close').addEventListener('click', () => modal.remove());
+    });
+
+    const safety = window.__MUSE_BRIDGE__.inspectReloadSafety();
+    expect(safety.isDialogOpen).toBe(false);
+
+    const res = await window.__MUSE_BRIDGE__.fetchUsageLimit(false, {
+      pollIntervalMs: 10,
+      maxTabWaitMs: 80,
+      maxLimitWaitMs: 80,
+      closeWaitMs: 10,
+      navWaitMs: 10,
+    });
+    expect(settingsClicked).toBe(true);
+    expect(res.used_percent).toBe(1);
+    expect(res.remaining_percent).toBe(99);
+    expect(window.__MUSE_LAST_LIMIT_TRACE__).not.toContain('dialog_open_fallback');
+  });
 });

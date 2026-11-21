@@ -157,120 +157,195 @@ function triggerReactClick(el) {
   }
 }
 
+function isElementVisible(el) {
+  if (!el || el.hidden) return false;
+  if (el.getAttribute && el.getAttribute('aria-hidden') === 'true') return false;
+  const style = typeof window.getComputedStyle === 'function' ? window.getComputedStyle(el) : null;
+  if (style && (style.display === 'none' || style.visibility === 'hidden')) return false;
+  return true;
+}
+
+function hasOpenDialog() {
+  const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]'));
+  return dialogs.some(isElementVisible);
+}
+
+function isInsideChatContent(el) {
+  return !!el && !!el.closest('[class*="prose" i], [class*="group/msg" i], [role="log"], textarea');
+}
+
+function getUsageLimitScopes() {
+  const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]')).filter(
+    isElementVisible
+  );
+  if (dialogs.length > 0) {
+    return dialogs.reverse();
+  }
+  const pathname = (typeof window !== 'undefined' && window.location && window.location.pathname) || '';
+  if (/^\/settings(?:\/|$)/i.test(pathname) && document.body) {
+    return [document.body];
+  }
+  return [];
+}
+
+function extractScopeLimitText(scope) {
+  if (!scope) return '';
+  if (scope === document.body) {
+    const clone = scope.cloneNode(true);
+    clone
+      .querySelectorAll('[class*="prose" i], [class*="group/msg" i], [role="log"], textarea')
+      .forEach((node) => node.remove());
+    return clone.innerText || clone.textContent || '';
+  }
+  return scope.innerText || scope.textContent || '';
+}
+
+function clampLimitPercent(raw) {
+  const num = parseFloat(raw);
+  if (!Number.isFinite(num)) return null;
+  return Math.max(0, Math.min(100, Math.round(num)));
+}
+
+function extractTextLimitFields(txt, state) {
+  if (!txt) return;
+  if (state.usedPercent === null) {
+    const mUsed = txt.match(/(\d+(?:\.\d+)?)\s*%\s*(?:使用済み|使用|used|consumed)/i);
+    if (mUsed) {
+      const p = clampLimitPercent(mUsed[1]);
+      if (p !== null) {
+        state.usedPercent = p;
+        if (state.remainingPercent === null) {
+          state.remainingPercent = Math.max(0, 100 - p);
+        }
+      }
+    }
+  }
+  if (state.remainingPercent === null) {
+    const mRem1 = txt.match(/(?:残り|残|remaining|left)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*%/i);
+    const mRem2 = txt.match(/(\d+(?:\.\d+)?)\s*%\s*(?:残り|残|remaining|left)/i);
+    const matchedRem = mRem1 ? mRem1[1] : (mRem2 ? mRem2[1] : null);
+    if (matchedRem !== null) {
+      const p = clampLimitPercent(matchedRem);
+      if (p !== null) {
+        state.remainingPercent = p;
+        if (state.usedPercent === null) {
+          state.usedPercent = Math.max(0, 100 - p);
+        }
+      }
+    }
+  }
+  if (!state.resetText) {
+    const mReset = txt.match(
+      /(\d+週間の上限は[^\n。]*リセットされます|\d+月\d+日にリセットされます|リセット\s*[:：]\s*[^\n。]+)/
+    );
+    if (mReset) {
+      state.resetText = mReset[1].trim();
+    }
+  }
+}
+
 function scanDomForLimit() {
-  let planName = '';
-  let usedPercent = null;
-  let remainingPercent = null;
-  let resetText = '';
+  const scopes = getUsageLimitScopes();
+  if (scopes.length === 0) return null;
 
-  const planEl = document.querySelector('span.text-body.text-text-primary, [class*="plan" i]');
-  if (planEl) {
-    const t = (planEl.textContent || '').trim();
-    if (t.includes('プラン') || t.includes('Plan') || t.includes('Free') || t.includes('無料') || t.includes('Pro')) {
-      planName = t;
-    }
-  }
+  let partialResult = null;
 
-  // プログレスバー要素の属性（aria-valuenow や style="width: 50%" 等）からパーセントを検出
-  const progressBars = Array.from(document.querySelectorAll('[role="progressbar"], [class*="progress" i]'));
-  for (const bar of progressBars) {
-    let p = null;
-    const valNow = bar.getAttribute('aria-valuenow');
-    if (valNow !== null && !isNaN(parseInt(valNow, 10))) {
-      p = Math.max(0, Math.min(100, parseInt(valNow, 10)));
-    } else {
-      const wMatch = (bar.getAttribute('style') || '').match(/width\s*:\s*(\d+(?:\.\d+)?)\s*%/i);
-      if (wMatch) {
-        p = Math.round(parseFloat(wMatch[1]));
-      }
-    }
-
-    if (p !== null) {
-      const container = bar.closest('[role="dialog"], [class*="modal" i], div');
-      const parentTxt = (container?.innerText || container?.textContent || '').toLowerCase();
-      if (parentTxt.includes('残り') || parentTxt.includes('left') || parentTxt.includes('remaining')) {
-        remainingPercent = p;
-        usedPercent = 100 - p;
-      } else {
-        usedPercent = p;
-        remainingPercent = Math.max(0, 100 - p);
-      }
-      break;
-    }
-  }
-
-  // 結合テキスト（innerText または textContent）からの判定を最優先（React等で「56%」と「使用済み」が別ノードに分割されている場合に対応）
-  const allText = document.body ? (document.body.innerText || document.body.textContent || '') : '';
-  if (allText) {
-    if (usedPercent === null) {
-      const mUsed = allText.match(/(\d+(?:\.\d+)?)\s*%\s*(?:使用済み|使用|used|consumed)/i);
-      if (mUsed) {
-        usedPercent = Math.round(parseFloat(mUsed[1]));
-        if (remainingPercent === null) {
-          remainingPercent = Math.max(0, 100 - usedPercent);
-        }
-      }
-    }
-    if (remainingPercent === null) {
-      const mRem1 = allText.match(/(?:残り|残|remaining|left)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*%/i);
-      const mRem2 = allText.match(/(\d+(?:\.\d+)?)\s*%\s*(?:残り|残|remaining|left)/i);
-      if (mRem1) {
-        remainingPercent = Math.round(parseFloat(mRem1[1]));
-        if (usedPercent === null) usedPercent = Math.max(0, 100 - remainingPercent);
-      } else if (mRem2) {
-        remainingPercent = Math.round(parseFloat(mRem2[1]));
-        if (usedPercent === null) usedPercent = Math.max(0, 100 - remainingPercent);
-      }
-    }
-    if (!resetText) {
-      const mReset = allText.match(/(\d+週間の上限は[^\n。]*リセットされます|\d+月\d+日にリセットされます|リセット\s*[:：]?\s*[^\n。]+)/);
-      if (mReset) {
-        resetText = mReset[1].trim();
-      }
-    }
-  }
-
-  // 補助: 個別テキストノード走査（TreeWalker）
-  if ((usedPercent === null || remainingPercent === null || !resetText) && document.body) {
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    let node;
-    while ((node = walker.nextNode())) {
-      const txt = (node.textContent || '').trim();
-      if (!txt) continue;
-      if (usedPercent === null) {
-        const matchUsed = txt.match(/(\d+(?:\.\d+)?)\s*%\s*(?:使用済み|使用|used|consumed)/i);
-        if (matchUsed) {
-          usedPercent = Math.round(parseFloat(matchUsed[1]));
-          if (remainingPercent === null) remainingPercent = Math.max(0, 100 - usedPercent);
-        }
-      }
-      if (remainingPercent === null) {
-        const matchRem1 = txt.match(/(?:残り|残|remaining|left)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*%/i);
-        const matchRem2 = txt.match(/(\d+(?:\.\d+)?)\s*%\s*(?:残り|残|remaining|left)/i);
-        if (matchRem1) {
-          remainingPercent = Math.round(parseFloat(matchRem1[1]));
-          if (usedPercent === null) usedPercent = Math.max(0, 100 - remainingPercent);
-        } else if (matchRem2) {
-          remainingPercent = Math.round(parseFloat(matchRem2[1]));
-          if (usedPercent === null) usedPercent = Math.max(0, 100 - remainingPercent);
-        }
-      }
-      if (!resetText) {
-        const matchReset = txt.match(/(\d+週間の上限は[^\n。]*リセットされます|\d+月\d+日にリセットされます|リセット\s*[:：]?\s*[^\n。]+)/);
-        if (matchReset) resetText = matchReset[1].trim();
-      }
-    }
-  }
-
-  if (remainingPercent !== null || usedPercent !== null || planName || resetText) {
-    return {
-      plan_name: planName || '無料プラン',
-      used_percent: usedPercent,
-      remaining_percent: remainingPercent,
-      reset_text: resetText || ''
+  for (const scope of scopes) {
+    const state = {
+      planName: '',
+      usedPercent: null,
+      remainingPercent: null,
+      resetText: ''
     };
+
+    const planCandidates = Array.from(
+      scope.querySelectorAll('span.text-body.text-text-primary, [class*="plan" i]')
+    );
+    for (const planEl of planCandidates) {
+      if (isInsideChatContent(planEl)) continue;
+      const t = (planEl.textContent || '').trim();
+      if (t.includes('プラン') || t.includes('Plan') || t.includes('Free') || t.includes('無料') || t.includes('Pro')) {
+        state.planName = t;
+        break;
+      }
+    }
+
+    // 明示テキスト（「1%使用済み」「残り 72%」等）を設定ダイアログ内から最優先で抽出 (Issue #71)
+    const scopeText = extractScopeLimitText(scope);
+    extractTextLimitFields(scopeText, state);
+
+    // 補助: 個別テキストノード走査（TreeWalker）
+    if (state.usedPercent === null || state.remainingPercent === null || !state.resetText) {
+      const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        if (isInsideChatContent(node.parentElement)) continue;
+        const txt = (node.textContent || '').trim();
+        if (!txt) continue;
+        extractTextLimitFields(txt, state);
+      }
+    }
+
+    // フォールバック: 明示テキストが取得できない場合のみプログレスバー要素の属性・幅を参照
+    if (state.usedPercent === null && state.remainingPercent === null) {
+      const progressBars = Array.from(scope.querySelectorAll('[role="progressbar"], [class*="progress" i]'));
+      for (const bar of progressBars) {
+        if (isInsideChatContent(bar) || !isElementVisible(bar)) continue;
+        let p = null;
+        const valNow = bar.getAttribute('aria-valuenow');
+        if (valNow !== null && valNow.trim() !== '') {
+          p = clampLimitPercent(valNow);
+        } else {
+          const wMatch = (bar.getAttribute('style') || '').match(/width\s*:\s*(\d+(?:\.\d+)?)\s*%/i);
+          if (wMatch) {
+            p = clampLimitPercent(wMatch[1]);
+          }
+        }
+
+        if (p !== null) {
+          const container =
+            (bar.parentElement &&
+              bar.parentElement.closest(
+                '[role="dialog"], [aria-modal="true"], section, [class*="usage" i], [class*="limit" i], [class*="plan" i]'
+              )) ||
+            bar.parentElement ||
+            scope;
+          const parentTxt = (container?.innerText || container?.textContent || '').toLowerCase();
+          if (parentTxt.includes('使用済み') || parentTxt.includes('used') || parentTxt.includes('consumed')) {
+            state.usedPercent = p;
+            state.remainingPercent = Math.max(0, 100 - p);
+          } else if (parentTxt.includes('残り') || parentTxt.includes('left') || parentTxt.includes('remaining')) {
+            state.remainingPercent = p;
+            state.usedPercent = Math.max(0, 100 - p);
+          } else {
+            state.usedPercent = p;
+            state.remainingPercent = Math.max(0, 100 - p);
+          }
+          break;
+        }
+      }
+    }
+
+    if (state.remainingPercent !== null || state.usedPercent !== null) {
+      return {
+        plan_name: state.planName || '無料プラン',
+        used_percent: state.usedPercent,
+        remaining_percent: state.remainingPercent,
+        reset_text: state.resetText || ''
+      };
+    }
+
+    if (!partialResult && (state.planName || state.resetText)) {
+      partialResult = {
+        plan_name: state.planName || '無料プラン',
+        used_percent: null,
+        remaining_percent: null,
+        reset_text: state.resetText || ''
+      };
+    }
   }
-  return null;
+
+  return partialResult;
 }
 
 function findGeneralTab() {
@@ -951,7 +1026,7 @@ window.__MUSE_BRIDGE__ = {
     };
 
     const isDialogOpen = () => {
-      return !!document.querySelector('[role="dialog"]') || !!queryFirst(SELECTORS.modalCloseButton).el;
+      return hasOpenDialog();
     };
 
     const setTrace = (trace) => {
@@ -1188,7 +1263,7 @@ window.__MUSE_BRIDGE__ = {
       }
     }
     const trimmedDraft = draftText.trim();
-    const isDialogOpen = !!document.querySelector('[role="dialog"]') || !!queryFirst(SELECTORS.modalCloseButton).el;
+    const isDialogOpen = hasOpenDialog();
     return {
       isGenerating,
       hasDraft: trimmedDraft.length > 0,
